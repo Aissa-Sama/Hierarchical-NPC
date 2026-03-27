@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.env
+*.wav
+
+# Keys
+*.key
+.env*
