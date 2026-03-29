@@ -1,238 +1,239 @@
-# renderer.py — Modelo volumétrico por slices Y
+# render.py — Renderer volumétrico con proporciones anatómicas por consenso
 
 import numpy as np
 import pygame
+from character import TABLA_ANATOMICA
 
-VOX_RES     = 64
-CANVAS_SIZE = 64
+# Resoluciones disponibles
+RESOLUCIONES = [64, 96, 128, 192, 256]
+VOX_RES      = 128   # default
+CANVAS_SIZE  = 128
 
-# ─── Generador de máscaras 2D ─────────────────────────────────
+def set_resolucion(res):
+    global VOX_RES, CANVAS_SIZE
+    VOX_RES = res
+    CANVAS_SIZE = res
 
 def elipse_mask(size, cx, cz, rx, rz):
-    """Máscara bool [size x size] — elipse centrada en (cx, cz)."""
-    x = np.arange(size, dtype=np.float32)
-    z = np.arange(size, dtype=np.float32)
+    if rx <= 0 or rz <= 0:
+        return np.zeros((size, size), dtype=bool)
+    x  = np.arange(size, dtype=np.float32)
+    z  = np.arange(size, dtype=np.float32)
     xx, zz = np.meshgrid(x, z, indexing='ij')
     return ((xx-cx)/rx)**2 + ((zz-cz)/rz)**2 <= 1.0
 
 def circulo_mask(size, cx, cz, r):
     return elipse_mask(size, cx, cz, r, r)
 
-def union_mask(a, b):
-    return a | b
-
 def lerp(a, b, t):
     return a + (b-a) * np.clip(t, 0, 1)
 
-# ─── Definición de secciones por región Y ────────────────────
+def build_volume(char, pose="A"):
+    res = VOX_RES
+    h   = char["altura"]
+    c   = char["complexion"]
+    mid = res / 2.0
 
-def build_volume(char):
-    """
-    Construye volumen [X, Y, Z] slice por slice en Y.
-    Cada slice Y es una máscara 64x64 en plano XZ.
-    """
-    h  = char["altura"]
-    c  = char["complexion"]
-    mid = VOX_RES / 2.0
+    # Altura total en voxels
+    H  = int(res * 0.90 * h)
+    y0 = res - 1 - H   # top del personaje
 
-    # Altura total del personaje en slices
-    H  = int(56 * h)
-    # Posición Y donde empieza el personaje (desde arriba)
-    y0 = VOX_RES - 2 - H
+    volume = np.zeros((res, res, res), dtype=bool)
 
-    volume = np.zeros((VOX_RES, VOX_RES, VOX_RES), dtype=bool)
+    # Complejión modifica rx levemente
+    c_mod = 1.0 + (c - 0.5) * 0.3
 
-    # ── Proporciones en slices ────────────────────────────────
-    cab_h    = int(H * 0.165)   # cabeza
-    cuello_h = int(H * 0.045)   # cuello
-    torso_h  = int(H * 0.285)   # torso (hombros→cintura)
-    cadera_h = int(H * 0.085)   # cadera
-    pierna_h = int(H * 0.360)   # piernas
-    pie_h    = int(H * 0.060)   # pies
+    def region_slices(nombre):
+        """Genera slices para una región anatómica."""
+        y_s, y_e, rx_max, rx_min, rz_max = TABLA_ANATOMICA[nombre]
+        y_abs_s = y0 + int(H * y_s)
+        y_abs_e = y0 + int(H * y_e)
+        return y_abs_s, y_abs_e, rx_max, rx_min, rz_max
 
-    # ── Radios base ───────────────────────────────────────────
-    # Cabeza
-    cab_rx0  = 3.2 + c*0.5   # radio X top cabeza
-    cab_rx1  = 4.2 + c*0.6   # radio X mid cabeza (más ancha)
-    cab_rx2  = 3.5 + c*0.4   # radio X bot cabeza
-    cab_rz0  = 2.8 + c*0.4
-    cab_rz1  = 3.6 + c*0.5
-    cab_rz2  = 3.0 + c*0.3
+    # ── Torso y cabeza — slices centrales ────────────────────
+    regiones_centrales = [
+        "cabeza", "cuello", "hombros", "pecho",
+        "cintura", "cadera"
+    ]
 
-    # Cuello
-    cue_rx   = 1.6 + c*0.4
-    cue_rz   = 1.4 + c*0.3
+    for nombre in regiones_centrales:
+        y_s, y_e, rx_max, rx_min, rz_max = region_slices(nombre)
+        for y in range(y_s, min(y_e, res)):
+            if y < 0 or y >= res:
+                continue
+            t  = (y - y_s) / max(y_e - y_s, 1)
+            rx = lerp(rx_max, rx_min, t) * H * c_mod
+            rz = rz_max * H * (1.0 + (c - 0.5) * 0.15)
+            if rx < 0.5 or rz < 0.5:
+                continue
+            volume[:, y, :] |= elipse_mask(res, mid, mid, rx, rz)
 
-    # Torso — interpola entre 3 puntos
-    tor_rx_top = 6.5 + c*1.5   # hombros
-    tor_rx_mid = 4.0 + c*1.0   # cintura
-    tor_rx_bot = 5.5 + c*1.2   # base torso
-    tor_rz_top = 4.5 + c*0.8
-    tor_rz_mid = 3.2 + c*0.6
-    tor_rz_bot = 3.8 + c*0.7
+    # ── Piernas — dos columnas simétricas ─────────────────────
+    regiones_pierna = ["muslo", "rodilla", "pantorrilla", "tobillo"]
 
-    # Brazos — posición X y radio
-    brazo_cx   = mid - (tor_rx_top + 2.2 + c*0.5)
-    brazo_cx_d = mid + (tor_rx_top + 2.2 + c*0.5)
-    brazo_rx0  = 2.0 + c*0.5   # radio arriba
-    brazo_rx1  = 1.5 + c*0.4   # radio abajo
-    brazo_h    = int(H * 0.380)
+    # Offset lateral de piernas — se deriva de la cadera
+    _, _, cad_rx_max, _, _ = TABLA_ANATOMICA["cadera"]
+    pier_off_top = cad_rx_max * H * 0.55
+    pier_off_bot = pier_off_top * 0.70
 
-    # Manos
-    mano_r     = 1.8 + c*0.4
-    mano_h     = int(H * 0.055)
+    for nombre in regiones_pierna:
+        y_s, y_e, rx_max, rx_min, rz_max = region_slices(nombre)
+        _, _, _, _, cad_data = TABLA_ANATOMICA["cadera"]
 
-    # Cadera
-    cad_rx0    = 5.8 + c*1.4
-    cad_rx1    = 5.2 + c*1.2
-    cad_rz0    = 4.0 + c*0.8
-    cad_rz1    = 3.6 + c*0.7
+        # Progreso global de la pierna (0=inicio muslo, 1=fin tobillo)
+        y_muslo_s = y0 + int(H * TABLA_ANATOMICA["muslo"][0])
+        y_tobillo_e = y0 + int(H * TABLA_ANATOMICA["tobillo"][1])
+        pierna_total = max(y_tobillo_e - y_muslo_s, 1)
 
-    # Piernas
-    pier_off   = 3.0 + c*0.8   # offset del centro
-    pier_rx0   = 3.2 + c*0.8   # muslo
-    pier_rx1   = 2.0 + c*0.5   # pantorrilla
-    pier_rz0   = 2.8 + c*0.6
-    pier_rz1   = 1.8 + c*0.4
+        for y in range(y_s, min(y_e, res)):
+            if y < 0 or y >= res:
+                continue
+            t_seg  = (y - y_s) / max(y_e - y_s, 1)
+            t_glob = (y - y_muslo_s) / pierna_total
 
-    # Pies
-    pie_rx_v   = 3.5 + c*0.6
-    pie_rz_v   = 2.2 + c*0.4
-    pie_off_z  = 1.5   # pies ligeramente hacia adelante
-
-    # ── Posiciones Y absolutas ────────────────────────────────
-    y_cab_start   = y0
-    y_cab_end     = y0 + cab_h
-    y_cue_start   = y_cab_end
-    y_cue_end     = y_cue_start + cuello_h
-    y_tor_start   = y_cue_end
-    y_tor_end     = y_tor_start + torso_h
-    y_bra_start   = y_tor_start
-    y_bra_end     = y_bra_start + brazo_h
-    y_mano_start  = y_bra_end
-    y_mano_end    = y_mano_start + mano_h
-    y_cad_start   = y_tor_end
-    y_cad_end     = y_cad_start + cadera_h
-    y_pier_start  = y_cad_end
-    y_pier_end    = y_pier_start + pierna_h
-    y_pie_start   = y_pier_end
-    y_pie_end     = y_pie_start + pie_h
-
-    # ── Slice por slice ───────────────────────────────────────
-    for y in range(VOX_RES):
-
-        mask = np.zeros((VOX_RES, VOX_RES), dtype=bool)
-
-        # ── CABEZA ────────────────────────────────────────────
-        if y_cab_start <= y < y_cab_end:
-            t = (y - y_cab_start) / max(y_cab_end - y_cab_start, 1)
-            # Forma de cabeza: estrecha arriba, ancha en medio, estrecha abajo
-            # Usando Bézier cuadrático: top→mid→bot
-            if t < 0.5:
-                t2 = t * 2
-                rx = lerp(cab_rx0, cab_rx1, t2)
-                rz = lerp(cab_rz0, cab_rz1, t2)
+            # A-pose: piernas en V leve
+            if pose == "A":
+                pier_off = lerp(pier_off_top, pier_off_bot, t_glob)
             else:
-                t2 = (t - 0.5) * 2
-                rx = lerp(cab_rx1, cab_rx2, t2)
-                rz = lerp(cab_rz1, cab_rz2, t2)
-            mask |= elipse_mask(VOX_RES, mid, mid, rx, rz)
+                pier_off = pier_off_top * 0.85
 
-        # ── CUELLO ────────────────────────────────────────────
-        elif y_cue_start <= y < y_cue_end:
-            t = (y - y_cue_start) / max(y_cue_end - y_cue_start, 1)
-            rx = lerp(cab_rx2, cue_rx, t)
-            rz = lerp(cab_rz2, cue_rz, t)
-            mask |= elipse_mask(VOX_RES, mid, mid, rx, rz)
+            rx = lerp(rx_max, rx_min, t_seg) * H * c_mod
+            rz = rz_max * H * (1.0 + (c - 0.5) * 0.15)
+            if rx < 0.5 or rz < 0.5:
+                continue
 
-        # ── TORSO ─────────────────────────────────────────────
-        if y_tor_start <= y < y_tor_end:
-            t = (y - y_tor_start) / max(y_tor_end - y_tor_start, 1)
-            # Bézier cuadrático: hombros → cintura → base
-            if t < 0.5:
-                t2 = t * 2
-                rx = lerp(tor_rx_top, tor_rx_mid, t2)
-                rz = lerp(tor_rz_top, tor_rz_mid, t2)
-            else:
-                t2 = (t - 0.5) * 2
-                rx = lerp(tor_rx_mid, tor_rx_bot, t2)
-                rz = lerp(tor_rz_mid, tor_rz_bot, t2)
-            mask |= elipse_mask(VOX_RES, mid, mid, rx, rz)
+            mask  = elipse_mask(res, mid - pier_off, mid, rx, rz)
+            mask |= elipse_mask(res, mid + pier_off, mid, rx, rz)
+            volume[:, y, :] |= mask
 
-        # ── BRAZOS ────────────────────────────────────────────
-        if y_bra_start <= y < y_bra_end:
-            t  = (y - y_bra_start) / max(y_bra_end - y_bra_start, 1)
-            br = lerp(brazo_rx0, brazo_rx1, t)
-            # Brazo izquierdo
-            mask |= circulo_mask(VOX_RES, brazo_cx, mid, br)
-            # Brazo derecho
-            mask |= circulo_mask(VOX_RES, brazo_cx_d, mid, br)
+    # ── Pies ──────────────────────────────────────────────────
+    y_s, y_e, rx_max, rx_min, rz_max = region_slices("pie")
+    for y in range(y_s, min(y_e, res)):
+        if y < 0 or y >= res:
+            continue
+        t       = (y - y_s) / max(y_e - y_s, 1)
+        rx      = lerp(rx_max, rx_min, t) * H * c_mod
+        rz      = rz_max * H * 1.4   # pies más profundos (hacia adelante)
+        pie_off = pier_off_bot
+        cz_pie  = mid + rz * 0.25
+        if rx < 0.5 or rz < 0.5:
+            continue
+        mask  = elipse_mask(res, mid - pie_off, cz_pie, rx, rz)
+        mask |= elipse_mask(res, mid + pie_off, cz_pie, rx, rz)
+        volume[:, y, :] |= mask
 
-        # ── MANOS ─────────────────────────────────────────────
-        if y_mano_start <= y < y_mano_end:
-            mask |= circulo_mask(VOX_RES, brazo_cx,   mid, mano_r)
-            mask |= circulo_mask(VOX_RES, brazo_cx_d, mid, mano_r)
+    # ── Brazos — A-pose o T-pose ──────────────────────────────
+    # Brazos arrancan en hombros y terminan al nivel de la cadera
+    _, _, hom_rx_max, _, _ = TABLA_ANATOMICA["hombros"]
+    y_hom_s = y0 + int(H * TABLA_ANATOMICA["hombros"][0])
+    y_cad_e = y0 + int(H * TABLA_ANATOMICA["cadera"][1])
+    brazo_h = y_cad_e - y_hom_s
 
-        # ── CADERA ────────────────────────────────────────────
-        if y_cad_start <= y < y_cad_end:
-            t  = (y - y_cad_start) / max(y_cad_end - y_cad_start, 1)
-            rx = lerp(cad_rx0, cad_rx1, t)
-            rz = lerp(cad_rz0, cad_rz1, t)
-            mask |= elipse_mask(VOX_RES, mid, mid, rx, rz)
+    # Radios del brazo: grueso arriba (deltoides), delgado abajo (muñeca)
+    brazo_r_top = hom_rx_max * H * 0.32 * c_mod
+    brazo_r_bot = brazo_r_top * 0.55
 
-        # ── PIERNAS ───────────────────────────────────────────
-        if y_pier_start <= y < y_pier_end:
-            t  = (y - y_pier_start) / max(y_pier_end - y_pier_start, 1)
-            rx = lerp(pier_rx0, pier_rx1, t)
-            rz = lerp(pier_rz0, pier_rz1, t)
-            cx_i = mid - pier_off
-            cx_d = mid + pier_off
-            mask |= elipse_mask(VOX_RES, cx_i, mid, rx, rz)
-            mask |= elipse_mask(VOX_RES, cx_d, mid, rx, rz)
+    # Posición base X del brazo (en el hombro)
+    brazo_x_base = hom_rx_max * H * c_mod
 
-        # ── PIES ──────────────────────────────────────────────
-        if y_pie_start <= y < y_pie_end:
-            cz_pie = mid + pie_off_z
-            mask |= elipse_mask(VOX_RES, mid - pier_off, cz_pie,
-                                pie_rx_v, pie_rz_v)
-            mask |= elipse_mask(VOX_RES, mid + pier_off, cz_pie,
-                                pie_rx_v, pie_rz_v)
+    for y in range(y_hom_s, min(y_cad_e, res)):
+        if y < 0 or y >= res:
+            continue
+        t = (y - y_hom_s) / max(brazo_h, 1)
+        r = lerp(brazo_r_top, brazo_r_bot, t)
 
-        volume[:, y, :] = mask
+        if pose == "T":
+            # Brazos horizontales — offset X crece linealmente
+            bx = brazo_x_base + t * brazo_x_base * 0.8
+            bz = 0.0
+        else:
+            # A-pose — brazos bajan con inclinación ~30°
+            bx = brazo_x_base + t * brazo_x_base * 0.25
+            bz = t * r * 0.5   # leve hacia adelante
+
+        if r < 0.5:
+            continue
+        mask  = circulo_mask(res, mid - bx, mid + bz, r)
+        mask |= circulo_mask(res, mid + bx, mid + bz, r)
+        volume[:, y, :] |= mask
 
     return volume
 
-# ─── Proyección y sombreado ───────────────────────────────────
+def rotation_matrix_y(angle_deg):
+    a = np.radians(angle_deg)
+    return np.array([
+        [ np.cos(a), 0, np.sin(a)],
+        [ 0,         1, 0        ],
+        [-np.sin(a), 0, np.cos(a)],
+    ], dtype=np.float32)
 
-def project_and_shade(volume, char):
+def project_rotated(volume, char, angle_y=0.0):
+    res = VOX_RES
+    h   = char["altura"]
+    H   = int(res * 0.90 * h)
+    y0  = res - 1 - H
+
     piel = np.array(char["tono_piel"],  dtype=np.float32)
     ropa = np.array(char["color_ropa"], dtype=np.float32)
 
-    h  = char["altura"]
-    H  = int(56 * h)
-    y0 = VOX_RES - 2 - H
+    # Límites de color por región
+    y_cab_end  = y0 + int(H * 0.17)
+    y_tor_end  = y0 + int(H * 0.50)
 
-    cab_h    = int(H * 0.165)
-    cuello_h = int(H * 0.045)
-    torso_h  = int(H * 0.285)
-    cadera_h = int(H * 0.085)
-    pierna_h = int(H * 0.360)
+    mid = res / 2.0
+    R   = rotation_matrix_y(angle_y)
 
-    y_cab_end  = y0 + cab_h
-    y_cue_end  = y_cab_end + cuello_h
-    y_tor_end  = y_cue_end + torso_h
-    y_cad_end  = y_tor_end + cadera_h
-    y_pier_end = y_cad_end + pierna_h
+    img       = np.zeros((res, res, 4), dtype=np.uint8)
+    depth     = np.full((res, res), -1, dtype=np.int32)
+    color_buf = np.zeros((res, res, 3), dtype=np.float32)
 
-    # Depth buffer
-    depth = np.full((VOX_RES, VOX_RES), -1, dtype=np.int32)
-    for z in range(VOX_RES-1, -1, -1):
-        mask = volume[:, :, z] & (depth == -1)
-        depth[mask] = z
+    px_arr = np.arange(res, dtype=np.float32)
+    py_arr = np.arange(res, dtype=np.float32)
+    px_grid, py_grid = np.meshgrid(px_arr, py_arr, indexing='ij')
+
+    steps   = res * 2
+    z_start = -res
+
+    for step in range(steps):
+        z_cam = z_start + step
+        cx = px_grid - mid
+        cy = py_grid - mid
+        cz = np.full_like(cx, z_cam)
+
+        wx = R[0,0]*cx + R[0,2]*cz + mid
+        wy = cy + mid
+        wz = R[2,0]*cx + R[2,2]*cz + mid
+
+        xi = np.round(wx).astype(np.int32)
+        yi = np.round(wy).astype(np.int32)
+        zi = np.round(wz).astype(np.int32)
+
+        valid = (
+            (xi >= 0) & (xi < res) &
+            (yi >= 0) & (yi < res) &
+            (zi >= 0) & (zi < res) &
+            (depth == -1)
+        )
+
+        xi_c = np.clip(xi, 0, res-1)
+        yi_c = np.clip(yi, 0, res-1)
+        zi_c = np.clip(zi, 0, res-1)
+        occupied = volume[xi_c, yi_c, zi_c]
+
+        hit_mask = valid & occupied
+        depth[hit_mask] = step
+
+        y_world = wy[hit_mask].astype(int)
+        colors  = np.where(
+            (y_world < y_cab_end)[:, None], piel,
+            np.where(
+            (y_world < y_tor_end)[:, None], ropa,
+            piel))
+        color_buf[hit_mask] = colors
+
     hit = depth >= 0
 
-    # Sombreado
-    shade = np.ones((VOX_RES, VOX_RES), dtype=np.float32)
+    shade = np.ones((res, res), dtype=np.float32)
     if hit.any():
         d  = depth.astype(np.float32)
         gx = np.zeros_like(d)
@@ -251,36 +252,40 @@ def project_and_shade(volume, char):
         nx /= nln; ny /= nln; nz /= nln
 
         diffuse = np.clip(nx*lx + ny*ly + nz*lz, 0, 1)
-        ao      = np.clip(depth.astype(np.float32) / VOX_RES, 0, 1)
+        ao      = np.clip(depth.astype(np.float32) / (res*2), 0, 1)
         shade   = np.clip(0.25 + 0.55*diffuse + 0.20*ao, 0, 1)
 
-    # Colorear
-    img = np.zeros((CANVAS_SIZE, CANVAS_SIZE, 4), dtype=np.uint8)
-    for xi in range(VOX_RES):
-        for yi in range(VOX_RES):
+    for xi in range(res):
+        for yi in range(res):
             if not hit[xi, yi]:
                 continue
-            y = yi
-            if y < y_cab_end:
-                color = piel
-            elif y < y_cue_end:
-                color = piel
-            elif y < y_tor_end:
-                color = ropa
-            elif y < y_cad_end:
-                color = ropa
-            else:
-                color = piel
-
             s = shade[xi, yi]
-            img[yi, xi, :3] = np.clip(color * s, 0, 255).astype(np.uint8)
+            img[yi, xi, :3] = np.clip(color_buf[xi, yi] * s, 0, 255).astype(np.uint8)
             img[yi, xi,  3] = 255
 
     return img
 
-def render_to_surface(char):
-    vol  = build_volume(char)
-    img  = project_and_shade(vol, char)
+def render_to_surface(char, angle_y=0.0, pose="A"):
+    vol  = build_volume(char, pose)
+    img  = project_rotated(vol, char, angle_y)
     surf = pygame.surfarray.make_surface(img[:, :, :3].swapaxes(0, 1))
     surf.set_colorkey((0, 0, 0))
     return surf
+
+def export_sprite_sheet(char, pose="A"):
+    from PIL import Image as PILImage
+    angles = [0, 45, 90, 135, 180, 225, 270, 315]
+    res    = VOX_RES
+    vol    = build_volume(char, pose)
+    frames = []
+
+    for angle in angles:
+        img_arr = project_rotated(vol, char, angle)
+        pil_img = PILImage.frombytes("RGBA", (res, res), img_arr.tobytes())
+        frames.append(pil_img)
+
+    sheet = PILImage.new("RGBA", (res * 8, res), (0,0,0,0))
+    for i, frame in enumerate(frames):
+        sheet.paste(frame, (i * res, 0))
+
+    return sheet
