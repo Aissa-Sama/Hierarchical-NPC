@@ -1,3 +1,4 @@
+# ui_creator.py — Componentes de interfaz para el creador de NPCs
 import pygame
 
 ACCENT   = (100, 180, 255)
